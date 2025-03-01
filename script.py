@@ -9,9 +9,25 @@ import pathlib
 from datetime import datetime
 import pandas as pd
 from column_mappings import get_column_names, get_array_columns
+from loguru import logger
+import sys
+
+# Configure Loguru
+logger.remove()  # Remove default logger
+
+# Log to a file
+logger.add("/var/log/myscript.log", rotation="10GB", level="INFO", enqueue=True)
+
+# Log to systemd (stdout)
+logger.add(sys.stdout, format="{time} {level} {message}", level="INFO")
+
+# Log to systemd (stderr for errors)
+logger.add(sys.stderr, format="{time} {level} {message}", level="ERROR")
+
+logger.info("Script started successfully!")
 
 def get_latest_folder(sftp, remote_dir_path):
-    """Get the most recently created folder from the remote directory"""
+"""Get the most recently created folder from the remote directory"""
     folders = sftp.listdir(remote_dir_path)
     
     # Filter folders that match the expected pattern
@@ -22,85 +38,138 @@ def get_latest_folder(sftp, remote_dir_path):
     
     # Sort folders by the timestamp in their names (last 14 characters contain YYYYMMDDHHmmss)
     latest_folder = max(bwarm_folders, key=lambda x: x[-14:])
-    print(f"Latest folder found: {latest_folder}")
+    logger.info(f"Latest folder found: {latest_folder}")
     
     return latest_folder
 
-def download_partial_file(sftp, remote_path, local_path, max_size_mb=1):
-    """Download only the first max_size_mb MB of a file"""
-    max_size_bytes = max_size_mb * 1024 * 1024  # Convert MB to bytes
-    
-    with sftp.open(remote_path, 'rb') as remote_file:
-        with open(local_path, 'wb') as local_file:
-            bytes_transferred = 0
-            buffer_size = 32768  # 32KB buffer
+def display_remote_files_info(sftp, remote_path):
+    """Display information about all files in the remote directory"""
+    logger.info("\n=== Remote Files Information ===")
+    try:
+        remote_files = sftp.listdir(remote_path)
+        logger.info(f"Found {len(remote_files)} files in remote directory")
+        
+        total_size_bytes = 0
+        for filename in remote_files:
+            file_path = f"{remote_path}/{filename}"
+            try:
+                file_stat = sftp.stat(file_path)
+                file_size_bytes = file_stat.st_size
+                total_size_bytes += file_size_bytes
+                file_size_mb = file_size_bytes / (1024*1024)
+                file_size_gb = file_size_bytes / (1024*1024*1024)
+                
+                if file_size_gb >= 1:
+                    logger.info(f"Remote file: {filename} - Size: {file_size_gb:.2f} GB")
+                else:
+                    logger.info(f"Remote file: {filename} - Size: {file_size_mb:.2f} MB")
+            except Exception as e:
+                logger.error(f"Error getting stats for remote file {filename}: {str(e)}")
+                
+        total_size_gb = total_size_bytes / (1024*1024*1024)
+        if total_size_gb >= 1:
+            logger.info(f"\nTotal size of all remote files: {total_size_gb:.2f} GB")
+        else:
+            total_size_mb = total_size_bytes / (1024*1024)
+            logger.info(f"\nTotal size of all remote files: {total_size_mb:.2f} MB")
+    except Exception as e:
+        logger.error(f"Error listing remote directory {remote_path}: {str(e)}")
+
+def display_local_files_info(local_dir_path):
+    """Display information about all files in the local directory"""
+    logger.info("\n=== Local Files Information ===")
+    try:
+        if not os.path.exists(local_dir_path):
+            logger.info(f"Local directory {local_dir_path} does not exist yet")
+            return
             
-            # Read the header first (first line)
-            header = remote_file.readline()
-            local_file.write(header)
-            bytes_transferred += len(header)
-            
-            # Read the rest up to max_size_bytes
-            while bytes_transferred < max_size_bytes:
-                data = remote_file.read(min(buffer_size, max_size_bytes - bytes_transferred))
-                if not data:  # EOF
-                    break
-                local_file.write(data)
-                bytes_transferred += len(data)
-    
-    return bytes_transferred
+        local_files = [f for f in os.listdir(local_dir_path) if os.path.isfile(os.path.join(local_dir_path, f))]
+        logger.info(f"Found {len(local_files)} files in local directory")
+        
+        total_size_bytes = 0
+        for filename in local_files:
+            file_path = os.path.join(local_dir_path, filename)
+            try:
+                file_size_bytes = os.path.getsize(file_path)
+                total_size_bytes += file_size_bytes
+                file_size_mb = file_size_bytes / (1024*1024)
+                file_size_gb = file_size_bytes / (1024*1024*1024)
+                
+                if file_size_gb >= 1:
+                    logger.info(f"Local file: {filename} - Size: {file_size_gb:.2f} GB")
+                else:
+                    logger.info(f"Local file: {filename} - Size: {file_size_mb:.2f} MB")
+            except Exception as e:
+                logger.error(f"Error getting stats for local file {filename}: {str(e)}")
+                
+        total_size_gb = total_size_bytes / (1024*1024*1024)
+        if total_size_gb >= 1:
+            logger.info(f"\nTotal size of all local files: {total_size_gb:.2f} GB")
+        else:
+            total_size_mb = total_size_bytes / (1024*1024)
+            logger.info(f"\nTotal size of all local files: {total_size_mb:.2f} MB")
+    except Exception as e:
+        logger.error(f"Error listing local directory {local_dir_path}: {str(e)}")
+
+def download_file(sftp, remote_path, local_path):
+    """Download the entire file"""
+    logger.info(f"Downloading {os.path.basename(remote_path)}...")
+    sftp.get(remote_path, local_path)
+    file_size = os.path.getsize(local_path)
+    logger.info(f"✓ Downloaded {file_size / (1024*1024):.2f} MB")
+    return file_size
 
 def download_files_from_sftp(hostname, username, private_key_path, remote_dir_path, local_dir_path):
-    """Download partial TSV files from the most recent remote directory"""
-    print("\n=== Starting SFTP Connection ===")
-    print(f"Connecting to {hostname} as {username}...")
+    """Download TSV files from the most recent remote directory"""
+    logger.info("\n=== Starting SFTP Connection ===")
+    logger.info(f"Connecting to {hostname} as {username}...")
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     pkey = paramiko.RSAKey.from_private_key_file(private_key_path)
     
     ssh.connect(hostname=hostname, username=username, pkey=pkey)
     sftp = ssh.open_sftp()
-    print("✓ SFTP connection established")
+    logger.info("✓ SFTP connection established")
     
     try:
         # Get the latest folder
-        print("\n=== Finding Latest Folder ===")
+        logger.info("\n=== Finding Latest Folder ===")
         latest_folder = get_latest_folder(sftp, remote_dir_path)
         full_remote_path = f"{remote_dir_path}/{latest_folder}"
         
-        # Create local directory if it doesn't exist
-        local_folder_path = os.path.join(local_dir_path, latest_folder)
-        pathlib.Path(local_folder_path).mkdir(parents=True, exist_ok=True)
-        print(f"✓ Created local directory: {local_folder_path}")
+        # Display information about remote files before downloading
+        display_remote_files_info(sftp, full_remote_path)
+        
+        # Display information about existing local files 
+        display_local_files_info(local_dir_path)
         
         # List all files in the latest remote directory
-        print("\n=== Starting File Downloads ===")
+        logger.info("\n=== Starting File Downloads ===")
         remote_files = sftp.listdir(full_remote_path)
         tsv_files = [f for f in remote_files if f.endswith('.tsv')]
         downloaded_files = []
-        print(f"Found {len(tsv_files)} TSV files to download")
+        logger.info(f"Found {len(tsv_files)} TSV files to download")
         
         for filename in remote_files:
             if filename.endswith('.tsv'):
                 remote_path = f"{full_remote_path}/{filename}"
-                local_path = os.path.join(local_folder_path, filename)
+                local_path = os.path.join(local_dir_path, filename)
                 
                 # Get file size
                 file_size = sftp.stat(remote_path).st_size
-                print(f"Processing {filename} (Total size: {file_size / (1024*1024*1024):.2f} GB)")
+                logger.info(f"Processing {filename} (Total size: {file_size / (1024*1024*1024):.2f} GB)")
                 
-                # Download only first 100MB
-                bytes_downloaded = download_partial_file(sftp, remote_path, local_path)
+                # Download the entire file
+                bytes_downloaded = download_file(sftp, remote_path, local_path)
                 downloaded_files.append(local_path)
-                print(f"Downloaded first {bytes_downloaded / (1024*1024):.2f} MB of {filename}")
         
-        print(f"\n✓ Downloaded {len(downloaded_files)} files successfully")
+        logger.info(f"\n✓ Downloaded {len(downloaded_files)} files successfully")
         return downloaded_files
     
     finally:
         sftp.close()
         ssh.close()
-        print("\n=== Closed SFTP Connection ===")
+        logger.info("\n=== Closed SFTP Connection ===")
 
 def process_large_file(file_path, chunk_size=10000):
     """Generator function to read large TSV files in chunks with NaN handling"""
@@ -153,14 +222,14 @@ def upload_chunk_to_supabase(chunk, supabase_url, supabase_key, table_name):
         
         response = supabase.table(table_name).upsert(cleaned_chunk).execute()
         if 'data' in response:
-            print(f"Uploaded {len(response['data'])} rows to {table_name}")
+            logger.info(f"Uploaded {len(response['data'])} rows to {table_name}")
             return len(response['data'])
         return 0
     except Exception as e:
-        print(f"Error uploading chunk: {str(e)}")
-        # Print a sample of the problematic data for debugging
+        logger.error(f"Error uploading chunk: {str(e)}")
+        # logger.info a sample of the problematic data for debugging
         if chunk:
-            print(f"Sample problematic record: {chunk[0]}")
+            logger.info(f"Sample problematic record: {chunk[0]}")
         return 0
 
 def get_table_name_from_filename(filename):
@@ -173,7 +242,7 @@ def process_and_upload_file(file_path, supabase_url, supabase_key, chunk_size=10
     total_rows = 0
     chunk_count = 0
     
-    print(f"Processing {file_path}")
+    logger.info(f"Processing {file_path}")
     
     try:
         for chunk in process_large_file(file_path, chunk_size):
@@ -186,12 +255,12 @@ def process_and_upload_file(file_path, supabase_url, supabase_key, chunk_size=10
                 table_name=table_name
             )
             total_rows += rows_uploaded
-            print(f"Uploaded chunk {chunk_count} ({len(chunk)} rows) to {table_name}")
+            logger.info(f"Uploaded chunk {chunk_count} ({len(chunk)} rows) to {table_name}")
         
-        print(f"Completed uploading {total_rows} total rows to {table_name}")
+        logger.info(f"Completed uploading {total_rows} total rows to {table_name}")
         
     except Exception as e:
-        print(f"Error processing file {file_path}: {str(e)}")
+        logger.error(f"Error processing file {file_path}: {str(e)}")
 
 def main():
     # Load environment variables
@@ -230,9 +299,9 @@ def main():
                 file_path = os.path.join(local_dir, file)
                 if os.path.isfile(file_path):
                     downloaded_files.append(file_path)
-            print(f"Found {len(downloaded_files)} files in {local_dir}")
+            logger.info(f"Found {len(downloaded_files)} files in {local_dir}")
         else:
-            print(f"Local directory {local_dir} does not exist")
+            logger.info(f"Local directory {local_dir} does not exist")
 
         # Step 2: Process and upload each file in chunks
         # for file_path in downloaded_files:
@@ -244,7 +313,7 @@ def main():
         # )
 
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        logger.error(f"An error occurred: {str(e)}")
 
 if __name__ == "__main__":
     main()
