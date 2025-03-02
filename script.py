@@ -11,6 +11,7 @@ import pandas as pd
 from column_mappings import get_column_names, get_array_columns
 from loguru import logger
 import sys
+import time
 
 # Configure Loguru
 logger.remove()  # Remove default logger
@@ -27,7 +28,7 @@ logger.add(sys.stderr, format="{time} {level} {message}", level="ERROR")
 logger.info("Script started successfully!")
 
 def get_latest_folder(sftp, remote_dir_path):
-"""Get the most recently created folder from the remote directory"""
+    """Get the most recently created folder from the remote directory"""
     folders = sftp.listdir(remote_dir_path)
     
     # Filter folders that match the expected pattern
@@ -75,8 +76,8 @@ def display_remote_files_info(sftp, remote_path):
     except Exception as e:
         logger.error(f"Error listing remote directory {remote_path}: {str(e)}")
 
-def display_local_files_info(local_dir_path):
-    """Display information about all files in the local directory"""
+def display_local_files_info(local_dir_path, delete_files=True):
+    """Display information about all files in the local directory and optionally delete them"""
     logger.info("\n=== Local Files Information ===")
     try:
         if not os.path.exists(local_dir_path):
@@ -99,8 +100,14 @@ def display_local_files_info(local_dir_path):
                     logger.info(f"Local file: {filename} - Size: {file_size_gb:.2f} GB")
                 else:
                     logger.info(f"Local file: {filename} - Size: {file_size_mb:.2f} MB")
+                    
+                # Delete the file if requested
+                if delete_files:
+                    os.remove(file_path)
+                    logger.info(f"Deleted file: {filename}")
+                    
             except Exception as e:
-                logger.error(f"Error getting stats for local file {filename}: {str(e)}")
+                logger.error(f"Error processing local file {filename}: {str(e)}")
                 
         total_size_gb = total_size_bytes / (1024*1024*1024)
         if total_size_gb >= 1:
@@ -108,6 +115,9 @@ def display_local_files_info(local_dir_path):
         else:
             total_size_mb = total_size_bytes / (1024*1024)
             logger.info(f"\nTotal size of all local files: {total_size_mb:.2f} MB")
+            
+        if delete_files and local_files:
+            logger.info(f"All {len(local_files)} local files have been deleted")
     except Exception as e:
         logger.error(f"Error listing local directory {local_dir_path}: {str(e)}")
 
@@ -116,60 +126,111 @@ def download_file(sftp, remote_path, local_path):
     logger.info(f"Downloading {os.path.basename(remote_path)}...")
     sftp.get(remote_path, local_path)
     file_size = os.path.getsize(local_path)
-    logger.info(f"✓ Downloaded {file_size / (1024*1024):.2f} MB")
+    file_size_gb = file_size / (1024*1024*1024)
+    # Display in GB format
+    logger.info(f"✓ Downloaded {file_size_gb:.4f} GB")
     return file_size
 
-def download_files_from_sftp(hostname, username, private_key_path, remote_dir_path, local_dir_path):
+def download_files_from_sftp(hostname, username, private_key_path, remote_dir_path, local_dir_path, max_retries=3):
     """Download TSV files from the most recent remote directory"""
     logger.info("\n=== Starting SFTP Connection ===")
     logger.info(f"Connecting to {hostname} as {username}...")
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    pkey = paramiko.RSAKey.from_private_key_file(private_key_path)
     
-    ssh.connect(hostname=hostname, username=username, pkey=pkey)
-    sftp = ssh.open_sftp()
-    logger.info("✓ SFTP connection established")
-    
-    try:
-        # Get the latest folder
-        logger.info("\n=== Finding Latest Folder ===")
-        latest_folder = get_latest_folder(sftp, remote_dir_path)
-        full_remote_path = f"{remote_dir_path}/{latest_folder}"
-        
-        # Display information about remote files before downloading
-        display_remote_files_info(sftp, full_remote_path)
-        
-        # Display information about existing local files 
-        display_local_files_info(local_dir_path)
-        
-        # List all files in the latest remote directory
-        logger.info("\n=== Starting File Downloads ===")
-        remote_files = sftp.listdir(full_remote_path)
-        tsv_files = [f for f in remote_files if f.endswith('.tsv')]
-        downloaded_files = []
-        logger.info(f"Found {len(tsv_files)} TSV files to download")
-        
-        for filename in remote_files:
-            if filename.endswith('.tsv'):
-                remote_path = f"{full_remote_path}/{filename}"
-                local_path = os.path.join(local_dir_path, filename)
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            pkey = paramiko.RSAKey.from_private_key_file(private_key_path)
+            
+            # Add connection timeout and keep-alive options
+            ssh.connect(
+                hostname=hostname, 
+                username=username, 
+                pkey=pkey,
+                timeout=30,
+                banner_timeout=60
+            )
+            
+            # Set keep-alive packets
+            transport = ssh.get_transport()
+            transport.set_keepalive(30)  # Send keep-alive every 30 seconds
+            
+            sftp = ssh.open_sftp()
+            logger.info("✓ SFTP connection established")
+            
+            try:
+                # Get the latest folder
+                logger.info("\n=== Finding Latest Folder ===")
+                latest_folder = get_latest_folder(sftp, remote_dir_path)
+                full_remote_path = f"{remote_dir_path}/{latest_folder}"
                 
-                # Get file size
-                file_size = sftp.stat(remote_path).st_size
-                logger.info(f"Processing {filename} (Total size: {file_size / (1024*1024*1024):.2f} GB)")
+                # Display information about remote files before downloading
+                display_remote_files_info(sftp, full_remote_path)
                 
-                # Download the entire file
-                bytes_downloaded = download_file(sftp, remote_path, local_path)
-                downloaded_files.append(local_path)
-        
-        logger.info(f"\n✓ Downloaded {len(downloaded_files)} files successfully")
-        return downloaded_files
+                # Display information about existing local files and delete them
+                display_local_files_info(local_dir_path, delete_files=True)
+                
+                # Ensure the local directory exists after possible deletion
+                os.makedirs(local_dir_path, exist_ok=True)
+                
+                # List all files in the latest remote directory
+                logger.info("\n=== Starting File Downloads ===")
+                remote_files = sftp.listdir(full_remote_path)
+                tsv_files = [f for f in remote_files if f.endswith('.tsv')]
+                downloaded_files = []
+                logger.info(f"Found {len(tsv_files)} TSV files to download")
+                
+                for filename in remote_files:
+                    if filename.endswith('.tsv'):
+                        remote_path = f"{full_remote_path}/{filename}"
+                        local_path = os.path.join(local_dir_path, filename)
+                        
+                        # Get file size
+                        file_size = sftp.stat(remote_path).st_size
+                        logger.info(f"Processing {filename} (Total size: {file_size / (1024*1024*1024):.2f} GB)")
+                        
+                        # Download with retry mechanism
+                        file_retry = 0
+                        while file_retry < 3:  # Retry up to 3 times per file
+                            try:
+                                bytes_downloaded = download_file(sftp, remote_path, local_path)
+                                downloaded_files.append(local_path)
+                                break  # Success, exit retry loop
+                            except Exception as e:
+                                file_retry += 1
+                                logger.error(f"Error downloading {filename} (attempt {file_retry}): {str(e)}")
+                                if file_retry >= 3:
+                                    raise  # Re-raise after max retries
+                                logger.info(f"Retrying download in 5 seconds...")
+                                time.sleep(5)  # Wait before retry
+                
+                logger.info(f"\n✓ Downloaded {len(downloaded_files)} files successfully")
+                return downloaded_files
+                
+            finally:
+                sftp.close()
+                ssh.close()
+                logger.info("\n=== Closed SFTP Connection ===")
+                
+            # If we got here without exceptions, break out of the retry loop
+            break
+            
+        except paramiko.SSHException as e:
+            retry_count += 1
+            logger.error(f"SSH connection error (attempt {retry_count}/{max_retries}): {str(e)}")
+            if retry_count >= max_retries:
+                logger.error("Maximum retries reached. Giving up on SFTP connection.")
+                raise
+            wait_time = 2 ** retry_count  # Exponential backoff
+            logger.info(f"Retrying connection in {wait_time} seconds...")
+            time.sleep(wait_time)
+        except Exception as e:
+            logger.error(f"Unexpected error in SFTP connection: {str(e)}")
+            raise
     
-    finally:
-        sftp.close()
-        ssh.close()
-        logger.info("\n=== Closed SFTP Connection ===")
+    # This should never be reached if the function runs properly
+    raise Exception("Failed to establish SFTP connection after multiple attempts")
 
 def process_large_file(file_path, chunk_size=10000):
     """Generator function to read large TSV files in chunks with NaN handling"""
@@ -288,7 +349,8 @@ def main():
             username=config['sftp']['username'],
             private_key_path=config['sftp']['private_key_path'],
             remote_dir_path=config['sftp']['remote_dir_path'],
-            local_dir_path=config['sftp']['local_dir_path']
+            local_dir_path=config['sftp']['local_dir_path'],
+            max_retries=5  # Add retry parameter
         )
         
         # Get list of files from local directory
