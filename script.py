@@ -12,6 +12,10 @@ from column_mappings import get_column_names, get_array_columns
 from loguru import logger
 import sys
 import time
+import concurrent.futures
+import json
+import re
+import argparse
 
 # Configure Loguru
 logger.remove()  # Remove default logger
@@ -121,17 +125,31 @@ def display_local_files_info(local_dir_path, delete_files=True):
     except Exception as e:
         logger.error(f"Error listing local directory {local_dir_path}: {str(e)}")
 
-def download_file(sftp, remote_path, local_path):
-    """Download the entire file"""
+def download_file(sftp, remote_path, local_path, size_limit=None):
+    """
+    Download file from remote server
+    If size_limit is provided (in bytes), download only up to that size
+    """
     logger.info(f"Downloading {os.path.basename(remote_path)}...")
-    sftp.get(remote_path, local_path)
+    
+    if size_limit is not None:
+        # Download only a portion of the file
+        with open(local_path, 'wb') as local_file:
+            with sftp.open(remote_path, 'rb') as remote_file:
+                data = remote_file.read(size_limit)
+                local_file.write(data)
+        logger.info(f"✓ Downloaded first {size_limit/(1024*1024):.2f} MB (limited download)")
+    else:
+        # Download the entire file
+        sftp.get(remote_path, local_path)
+        
     file_size = os.path.getsize(local_path)
     file_size_gb = file_size / (1024*1024*1024)
     # Display in GB format
     logger.info(f"✓ Downloaded {file_size_gb:.4f} GB")
     return file_size
 
-def download_files_from_sftp(hostname, username, private_key_path, remote_dir_path, local_dir_path, max_retries=3):
+def download_files_from_sftp(hostname, username, private_key_path, remote_dir_path, local_dir_path, max_retries=3, size_limit=None):
     """Download TSV files from the most recent remote directory"""
     logger.info("\n=== Starting SFTP Connection ===")
     logger.info(f"Connecting to {hostname} as {username}...")
@@ -194,7 +212,7 @@ def download_files_from_sftp(hostname, username, private_key_path, remote_dir_pa
                         file_retry = 0
                         while file_retry < 3:  # Retry up to 3 times per file
                             try:
-                                bytes_downloaded = download_file(sftp, remote_path, local_path)
+                                bytes_downloaded = download_file(sftp, remote_path, local_path, size_limit)
                                 downloaded_files.append(local_path)
                                 break  # Success, exit retry loop
                             except Exception as e:
@@ -220,7 +238,7 @@ def download_files_from_sftp(hostname, username, private_key_path, remote_dir_pa
             retry_count += 1
             logger.error(f"SSH connection error (attempt {retry_count}/{max_retries}): {str(e)}")
             if retry_count >= max_retries:
-                logger.error("Maximum retries reached. Giving up on SFTP connection.")
+                logger.info("Maximum retries reached. Giving up on SFTP connection.")
                 raise
             wait_time = 2 ** retry_count  # Exponential backoff
             logger.info(f"Retrying connection in {wait_time} seconds...")
@@ -283,47 +301,234 @@ def upload_chunk_to_supabase(chunk, supabase_url, supabase_key, table_name):
         
         response = supabase.table(table_name).upsert(cleaned_chunk).execute()
         if 'data' in response:
-            logger.info(f"Uploaded {len(response['data'])} rows to {table_name}")
-            return len(response['data'])
-        return 0
+            return len(cleaned_chunk)  # Return the number of rows we attempted to upload
+        return 1
     except Exception as e:
-        logger.error(f"Error uploading chunk: {str(e)}")
-        # logger.info a sample of the problematic data for debugging
-        if chunk:
-            logger.info(f"Sample problematic record: {chunk[0]}")
-        return 0
+        # Re-raise the exception so the parent function can handle it with its retry logic
+        raise
 
 def get_table_name_from_filename(filename):
     """Convert filename to table name (e.g., 'sales_data.tsv' -> 'sales_data')"""
     return os.path.splitext(os.path.basename(filename))[0].lower()
 
-def process_and_upload_file(file_path, supabase_url, supabase_key, chunk_size=10000):
-    """Process and upload a large file in chunks"""
+def process_and_upload_file(file_path, supabase_url, supabase_key, chunk_size=10000, max_retries=3):
+    """Process and upload a large file in chunks with retry logic and progress display"""
     table_name = get_table_name_from_filename(file_path)
     total_rows = 0
+    total_rows_processed = 0
     chunk_count = 0
+    start_time = time.time()
     
-    logger.info(f"Processing {file_path}")
+    # Keep track of problematic records
+    problematic_records = []
     
+    logger.info(f"📂 Processing {os.path.basename(file_path)}")
+    
+    # Count total rows for progress calculation
+    try:
+        total_file_rows = sum(1 for _ in open(file_path, 'r', encoding='utf-8'))
+        logger.info(f"📊 Total rows in file: {total_file_rows:,}")
+    except Exception as e:
+        logger.info(f"⚠️ Could not count total rows: {str(e)}")
+        total_file_rows = 0
+    
+    def upload_with_retry(records, max_attempts=3):
+        """Try to upload records with retry logic for transient errors"""
+        for attempt in range(max_attempts):
+            try:
+                if not records:  # Skip empty record lists
+                    return True
+                    
+                return upload_chunk_to_supabase(
+                    chunk=records,
+                    supabase_url=supabase_url,
+                    supabase_key=supabase_key,
+                    table_name=table_name
+                ) > 0
+            except Exception as e:
+                error_str = str(e)
+                # Only retry for network errors, not data errors
+                if ("[Errno 54]" in error_str or "StreamReset" in error_str) and attempt < max_attempts - 1:
+                    wait_time = 2 ** attempt
+                    logger.error(f"⚠️ Network error, retrying in {wait_time}s... (attempt {attempt+1}/{max_attempts})")
+                    time.sleep(wait_time)
+                else:
+                    # For data errors or final attempt, return False to indicate failure
+                    return False
+        return False
+    
+    def binary_search_upload(records, isolation_threshold=5):
+        """
+        Use binary search approach to isolate and identify problematic records.
+        Returns the number of successfully uploaded records.
+        """
+        nonlocal total_rows
+        
+        # Base case: empty list
+        if not records:
+            return 0
+            
+        # Base case: if we're down to a small number of records, try them one by one
+        if len(records) <= isolation_threshold:
+            success_count = 0
+            for i, record in enumerate(records):
+                if upload_with_retry([record]):
+                    success_count += 1
+                    total_rows += 1
+                else:
+                    problematic_records.append(record)
+            return success_count
+            
+        # Try to upload the whole chunk first
+        if upload_with_retry(records):
+            total_rows += len(records)
+            return len(records)
+            
+        # If failed, split and try each half separately
+        mid = len(records) // 2
+        first_half = records[:mid]
+        second_half = records[mid:]
+        
+        # Process each half
+        success_first = binary_search_upload(first_half, isolation_threshold)
+        success_second = binary_search_upload(second_half, isolation_threshold)
+        
+        return success_first + success_second
+    
+    # Process the file
     try:
         for chunk in process_large_file(file_path, chunk_size):
             chunk_count += 1
-
-            rows_uploaded = upload_chunk_to_supabase(
-                chunk=chunk,
-                supabase_url=supabase_url,
-                supabase_key=supabase_key,
-                table_name=table_name
-            )
-            total_rows += rows_uploaded
-            logger.info(f"Uploaded chunk {chunk_count} ({len(chunk)} rows) to {table_name}")
+            chunk_start_time = time.time()
+            
+            logger.info(f"🔄 Processing chunk {chunk_count} of {table_name} ({len(chunk)} rows)")
+            
+            # Use binary search approach to upload as many records as possible
+            successful_records = binary_search_upload(chunk)
+            total_rows_processed += len(chunk)
+            
+            # Calculate and display progress
+            chunk_elapsed = time.time() - chunk_start_time
+            speed = successful_records / chunk_elapsed if chunk_elapsed > 0 else 0
+            
+            if total_file_rows > 0:
+                progress_pct = min(100, (total_rows_processed / total_file_rows) * 100)
+                logger.info(f"{progress_pct:.1f}% Chunk {chunk_count}: {successful_records}/{len(chunk)} successful ({speed:.1f} r/s)")
+            else:
+                logger.info(f"Chunk {chunk_count}: {successful_records}/{len(chunk)} successful ({speed:.1f} r/s)")
         
-        logger.info(f"Completed uploading {total_rows} total rows to {table_name}")
+        # Final statistics
+        total_elapsed = time.time() - start_time
+        avg_speed = total_rows / total_elapsed if total_elapsed > 0 else 0
+        success_rate = (total_rows / total_rows_processed) * 100 if total_rows_processed > 0 else 0
+        
+        logger.info(f"\n✅ Completed {table_name}: {total_rows:,}/{total_rows_processed:,} rows ({success_rate:.1f}% success) in {format_time(total_elapsed)} "
+              f"(avg: {avg_speed:.1f} rows/sec)")
+        
+        # Report problematic records
+        if problematic_records:
+            logger.info(f"⚠️ {len(problematic_records)} records could not be uploaded due to data issues")
+            
+            # Save problematic records to a file for later inspection
+            error_file = f"{os.path.splitext(file_path)[0]}_errors.json"
+            try:
+                with open(error_file, 'w', encoding='utf-8') as f:
+                    json.dump(problematic_records[:1000], f, indent=2)  # Save up to 1000 for investigation
+                logger.info(f"💾 Problematic records saved to {error_file}")
+                
+                # Try to logger.info some diagnostic info about the first few problematic records
+                logger.info(f"Sample of problematic records:")
+                for i, record in enumerate(problematic_records[:3]):
+                    logger.info(f"  Record {i+1}: {json.dumps(record)[:200]}...")
+            except Exception as save_err:
+                logger.error(f"Could not save error records: {str(save_err)}")
         
     except Exception as e:
-        logger.error(f"Error processing file {file_path}: {str(e)}")
+        logger.error(f"❌ Error processing file {os.path.basename(file_path)}: {str(e)}")
+
+def format_time(seconds):
+    """Format time in seconds to a readable string"""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = seconds // 60
+        sec = seconds % 60
+        return f"{int(minutes)}m {int(sec)}s"
+    else:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        sec = seconds % 60
+        return f"{int(hours)}h {int(minutes)}m {int(sec)}s"
+
+def get_processing_order():
+    """Returns the ordered list of tables to process based on dependencies"""
+    # Define the processing steps in order with exact file names
+    processing_steps = {
+        1: ["works.tsv", "parties.tsv", "releases.tsv"],
+        2: ["releaseidentifiers.tsv", "recordings.tsv", "workidentifiers.tsv", "workalternativetitles.tsv", "workrightshares.tsv"],
+        3: ["recordingalternativetitles.tsv", "worksrecordings.tsv", "unclaimedworkrightshares.tsv"]
+    }
+    
+    # Flatten into a single ordered list of base filenames
+    ordered_tables = []
+    for step in sorted(processing_steps.keys()):
+        ordered_tables.extend(processing_steps[step])
+    
+    return ordered_tables, processing_steps
+
+def process_step_in_parallel(files, supabase_url, supabase_key, max_workers=4):
+    """Process multiple files in parallel with a limit on concurrent workers and progress tracking"""
+    total_files = len(files)
+    completed_files = 0
+    start_time = time.time()
+    
+    logger.info(f"\n=== Starting parallel processing of {total_files} files with {max_workers} workers ===")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Map files to future objects
+        future_to_file = {
+            executor.submit(
+                process_and_upload_file,
+                file_path=file_path,
+                supabase_url=supabase_url,
+                supabase_key=supabase_key,
+                chunk_size=1000,
+            ): file_path for file_path in files
+        }
+        
+        # Process completed futures
+        for future in concurrent.futures.as_completed(future_to_file):
+            file_path = future_to_file[future]
+            try:
+                future.result()
+                completed_files += 1
+                
+                # Calculate overall progress
+                progress_pct = (completed_files / total_files) * 100
+                elapsed = time.time() - start_time
+                
+                # Progress bar for overall completion
+                bar_length = 30
+                filled_length = int(bar_length * progress_pct / 100)
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                
+                logger.info(f"\n🔄 OVERALL PROGRESS: [{bar}] {progress_pct:.1f}% | "
+                      f"Completed: {completed_files}/{total_files} files | "
+                      f"Elapsed: {format_time(elapsed)}")
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing {os.path.basename(file_path)}: {str(e)}")
+    
+    # Final statistics
+    total_elapsed = time.time() - start_time
+    logger.info(f"\n✅ STEP COMPLETED: Processed {completed_files}/{total_files} files in {format_time(total_elapsed)}")
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Process and upload data files to Supabase.')
+    parser.add_argument('--row-by-row', action='store_true', help='Process each row individually instead of in batches')
+    args = parser.parse_args()
+    
     # Load environment variables
     load_dotenv()
     
@@ -343,39 +548,68 @@ def main():
     }
 
     try:
-        # Step 1: Download files from the latest SFTP folder
-        downloaded_files = download_files_from_sftp(
-            hostname=config['sftp']['hostname'],
-            username=config['sftp']['username'],
-            private_key_path=config['sftp']['private_key_path'],
-            remote_dir_path=config['sftp']['remote_dir_path'],
-            local_dir_path=config['sftp']['local_dir_path'],
-            max_retries=5  # Add retry parameter
-        )
-        
+
+        # downloaded_files = download_files_from_sftp(
+        #     hostname=config['sftp']['hostname'],
+        #     username=config['sftp']['username'],
+        #     private_key_path=config['sftp']['private_key_path'],
+        #     remote_dir_path=config['sftp']['remote_dir_path'],
+        #     local_dir_path=config['sftp']['local_dir_path'],
+        #     max_retries=5,  # Add retry parameter
+        # )
         # Get list of files from local directory
         local_dir = config['sftp']['local_dir_path']
+        available_files = {}  # Use a dictionary to map filename -> full path
         
+        logger.info(f"\n=== Reading files from local directory: {local_dir} ===")
         if os.path.exists(local_dir):
             for file in os.listdir(local_dir):
                 file_path = os.path.join(local_dir, file)
-                if os.path.isfile(file_path):
-                    downloaded_files.append(file_path)
-            logger.info(f"Found {len(downloaded_files)} files in {local_dir}")
+                if os.path.isfile(file_path) and file.endswith('.tsv'):
+                    available_files[file] = file_path  # Store by filename for exact matching
+                    logger.info(f"Found file: {file}")
+            logger.info(f"Found {len(available_files)} TSV files in {local_dir}")
         else:
             logger.info(f"Local directory {local_dir} does not exist")
+            return
 
-        # Step 2: Process and upload each file in chunks
-        # for file_path in downloaded_files:
-        #     process_and_upload_file(
-        #         file_path=file_path,
-        #         supabase_url=config['supabase']['url'],
-        #     supabase_key=config['supabase']['key'],
-        #     chunk_size=2000
-        # )
+        # Get ordered list of tables and processing steps
+        ordered_tables, processing_steps = get_processing_order()
+        
+        # Process files in the correct order by step
+        for step, file_list in sorted(processing_steps.items()):
+            logger.info(f"\n=== Processing Step {step} ===")
+            step_files = []
+            
+            # Find files that match exactly with this step's file list
+            for filename in file_list:
+                if filename in available_files:
+                    step_files.append(available_files[filename])
+                else:
+                    logger.info(f"Warning: File {filename} not found in directory")
+            
+            if not step_files:
+                logger.info(f"No files found for step {step}: {file_list}")
+                continue
+                
+            logger.info(f"Processing {len(step_files)} files for step {step} in parallel:")
+            for file_path in step_files:
+                logger.info(f"  - {os.path.basename(file_path)}")
+            
+            # Process this step's files in parallel
+            process_step_in_parallel(
+                files=step_files,
+                supabase_url=config['supabase']['url'],
+                supabase_key=config['supabase']['key'],
+                max_workers=4,  # Adjust based on your server capacity
+            )
+            
+            logger.info(f"Completed processing step {step}")
 
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
+        import traceback
+        traceback.logger.info_exc()
 
 if __name__ == "__main__":
     main()

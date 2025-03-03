@@ -55,6 +55,91 @@ COLUMN_MAPPING = {
         ],
         'array_columns': []
     },
+    'unclaimedworkrightshares': {
+        'columns': [
+            'unclaimed_musical_work_right_share_record_id',
+            'resource_record_id',
+            'musical_work_record_id',
+            'isrc',
+            'dsp_resource_id',
+            'resource_title',
+            'resource_subtitle',
+            'alternative_resource_title',
+            'display_artist_name',
+            'display_artist_isni',
+            'duration',
+            'unclaimed_right_share_percentage',
+            'percentile_for_prioritisation',
+        ],
+        'array_columns': [
+            'alternative_resource_title',
+        ]
+    },
+    'recordings': {
+        'columns': [
+            'resource_record_id',
+            'resource_type',
+            'title',
+            'display_artist_name',
+            'isrc',
+            'language_and_script_code',
+            'sub_title',
+            'display_artist_isni',
+            'p_line',
+            'c_line',
+            'duration',
+            'release_record_id',
+            'studio_producer_name',
+            'studio_producer_proprietary_id',
+            'original_data_provider_name',
+            'original_data_provider_dpid',
+            'is_data_provided_as_received',
+        ],
+        'array_columns': [
+            'p_line',
+            'c_line',
+            'studio_producer_name',
+            'studio_producer_proprietary_id',
+        ]
+    },
+    'recordingalternativetitles': {
+        'columns': [
+            'alternative_resource_title_record_id',
+            'resource_record_id',
+            'alternative_title',
+            'language_and_script_code',
+            'alternative_title_type',
+        ],
+        'array_columns': []
+    },
+    'recordingidentifiers': {
+        'columns': [
+            'proprietary_resource_identifier_record_id',
+            'resource_record_id',
+            'proprietary_id',
+            'allocating_party_record_id',
+        ],
+        'array_columns': []
+    },
+    'workidentifiers': {
+        'columns': [
+            'proprietary_musical_work_identifier_record_id',
+            'musical_work_record_id',
+            'proprietary_id',
+            'allocating_party_record_id',
+        ],
+        'array_columns': []
+    },
+    'workalternativetitles': {
+        'columns': [
+            'alternative_musical_work_title_record_id',
+            'musical_work_record_id',
+            'alternative_title',
+            'language_and_script_code',
+            'alternative_title_type',
+        ],
+        'array_columns': []
+    },
     'workrightshares': {
         'columns': [
             'musical_work_right_share_record_id',
@@ -106,24 +191,6 @@ COLUMN_MAPPING = {
         ],
         'array_columns': []
     },
-    'unclaimedshares': {
-        'columns': [
-            'unclaimed_share_id',
-            'resource_id',
-            'work_id',
-            'isrc',
-            'dsp_resource_id',
-            'resource_title',
-            'resource_subtitle',
-            'alternative_titles',
-            'display_artist',
-            'display_artist_isni',
-            'duration',
-            'unclaimed_percentage',
-            'priority_percentile'
-        ],
-        'array_columns': []
-    }
 }
 
 def get_column_names(table_name):
