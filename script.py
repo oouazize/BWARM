@@ -397,6 +397,10 @@ def process_and_upload_file(file_path, supabase_url, supabase_key, chunk_size=10
     
     # Process the file
     try:
+        # Track the last reported milestone
+        last_milestone = 0
+        milestones = [15, 30, 45, 60, 75, 90, 100]
+        
         for chunk in process_large_file(file_path, chunk_size):
             chunk_count += 1
             chunk_start_time = time.time()
@@ -407,15 +411,21 @@ def process_and_upload_file(file_path, supabase_url, supabase_key, chunk_size=10
             successful_records = binary_search_upload(chunk)
             total_rows_processed += len(chunk)
             
-            # Calculate and display progress
+            # Calculate progress
             chunk_elapsed = time.time() - chunk_start_time
             speed = successful_records / chunk_elapsed if chunk_elapsed > 0 else 0
             
             if total_file_rows > 0:
                 progress_pct = min(100, (total_rows_processed / total_file_rows) * 100)
-                logger.info(f"{progress_pct:.1f}% Chunk {chunk_count}: {successful_records}/{len(chunk)} successful ({speed:.1f} r/s)")
+                
+                # Check if we've reached a new milestone
+                current_milestone = next((m for m in milestones if m > last_milestone and progress_pct >= m), None)
+                if current_milestone:
+                    logger.info(f"📊 {current_milestone}% complete - {table_name} - Chunk {chunk_count}: {successful_records}/{len(chunk)} successful ({speed:.1f} r/s)")
+                    last_milestone = current_milestone
             else:
-                logger.info(f"Chunk {chunk_count}: {successful_records}/{len(chunk)} successful ({speed:.1f} r/s)")
+                # If total_file_rows is unknown, just show chunk information
+                logger.info(f"{table_name} - Chunk {chunk_count}: {successful_records}/{len(chunk)} successful ({speed:.1f} r/s)")
         
         # Final statistics
         total_elapsed = time.time() - start_time
